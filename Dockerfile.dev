@@ -1,0 +1,27 @@
+# Dockerfile for ElastiCluster
+
+FROM ubuntu
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y exuberant-ctags sudo vim-nox git screen && \
+    useradd -m void -s /bin/bash -G sudo && \
+    sed -i 's/%sudo.*ALL=(ALL:ALL).*ALL/%sudo ALL=(ALL:ALL) NOPASSWD:ALL/' /etc/sudoers
+
+RUN : \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+           ca-certificates \
+           python-pip \
+           python-dev \
+           curl \
+           g++ \
+           gcc \
+           libc6 libc6-dev \
+           libexpat1 libexpat1-dev \
+           libffi6 libffi-dev \
+           libssl1.0.0 libssl-dev \
+           make \
+    && pip install virtualenv \
+    ;
+
+WORKDIR /home/void
+USER void
