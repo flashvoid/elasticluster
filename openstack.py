@@ -193,8 +193,9 @@ class OpenStackCloudProvider(AbstractCloudProvider):
         self._instances = {}
         self._cached_instances = {}
 
-        self.manage_anti_affinity_groups = manage_anti_affinity_groups
         self.anti_affinity_group_prefix = anti_affinity_group_prefix
+        # constant for anti-affinity routines.
+        self.middle_token = ".number."
 
     @staticmethod
     def _get_os_config_value(thing, value, varnames, default=_NO_DEFAULT):
@@ -508,54 +509,30 @@ class OpenStackCloudProvider(AbstractCloudProvider):
 
 
 
-        import ipdb
-        ipdb.set_trace()
-        
         out_of_capacity = 'No valid host was found. There are not enough hosts available.'
 
-        if self.manage_anti_affinity_groups:
+        # create anti-affinity groups for spawning servers to ensure server spread
+        # equally across hosts in the cloud.
+        # This will create a server group, spawn hosts in the group until it's full
+        # and then create a new group.
+        if self.anti_affinity_group_prefix:
             with OpenStackCloudProvider.__node_start_lock:
-                if not self.anti_affinity_group_prefix:
-                    raise Exception("manage_anti_affinity_groups without aaf_prefix")
 
-                grp={}
-                for k,v in [ (group.name, group) for group in self.nova_client.server_groups.list() if self.anti_affinity_group_prefix + ".number." in group.name ]: grp[k]=v
-
-                if grp:
-                    group_name=sorted(grp.keys())[-1]
-                    gid=grp[group_name].id
-                else:
-                    group=self.nova_client.server_groups.create(name=self.anti_affinity_group_prefix + ".number.1", policies='anti-affinity')
-                    group_name=group.name
-                    gid=group.id
-
-                # split_name=group_name.split('.')
-                # split_name[-1]=str(int(split_name[-1])+1)
-                # group_name='.'.join(split_name)
-
-                # try: gid=self.nova_client.server_groups.create(policies='anti-affinity')
-                hints={}
-                hints['group']=gid
-                vm_start_args['scheduler_hints']=hints
+                group = self._get_current_anti_affinity_group()
+                vm_start_args['scheduler_hints']={ 'group' : group.id }
                 vm = self.nova_client.servers.create(node_name, image_id, flavor, **vm_start_args)
-                sleep(1)
-                vm.get()
-                
-                if vm.status == 'ERROR' and vm.fault['message'] == out_of_capacity:
-                    log.info("Deleting instance %s(%s) in group %s", vm.name, vm.id, group_name)
-                    self.nova_client.servers.delete(vm.id)
-                    sleep(1)
+                self._wait_for_status(vm, ["ACTIVE", "ERROR"], 10)
 
-                    split_name=group_name.split('.')
-                    split_name[-1]=str(int(split_name[-1])+1)
-                    group_name='.'.join(split_name)
-                    gid=self.nova_client.server_groups.create(name=group_name, policies='anti-affinity').id
-                    hints['group']=gid
-                    vm_start_args['scheduler_hints']=hints
+                if vm.status == 'ERROR' and vm.fault['message'] == out_of_capacity:
+                    log.debug("Deleting instance %s(%s) in group %s", vm.name, vm.id, group.name)
+                    self.nova_client.servers.delete(vm.id)
+
+                    group=self._get_next_anti_affinity_group()
+                    vm_start_args['scheduler_hints']={ 'group' : group.id }
                     
                     vm = self.nova_client.servers.create(node_name, image_id, flavor, **vm_start_args)
 
-                log.info("Started server %s in group %s", vm.name, group_name)
+                log.debug("Started server %s in group %s", vm.name, group.name)
         else:
             # due to some `nova_client.servers.create()` implementation weirdness,
             # the first three args need to be spelt out explicitly and cannot be
@@ -588,6 +565,7 @@ class OpenStackCloudProvider(AbstractCloudProvider):
         self._init_os_api()
         instance = self._load_instance(instance_id)
         instance.delete()
+        self._delete_anti_affinity_groups()
         del self._instances[instance_id]
 
     def get_ips(self, instance_id):
@@ -613,6 +591,39 @@ class OpenStackCloudProvider(AbstractCloudProvider):
         return instance.status == 'ACTIVE'
 
     # Protected methods
+
+    def _delete_anti_affinity_groups(self):
+        for group in self._list_anti_affinity_groups():
+            self.nova_client.server_groups.delete(group.id)
+
+    def _get_next_anti_affinity_group(self):
+        group_name=self._make_next_group_name(self._get_current_anti_affinity_group().name)
+        return self.nova_client.server_groups.create(name=group_name, policies='anti-affinity')
+
+    def _get_current_anti_affinity_group(self):
+        groups=self._list_anti_affinity_groups()
+
+        if groups:
+            group = sorted(groups, key=lambda g: g.name)[-1]
+        else:
+            group = self.nova_client.server_groups.create(name=self.anti_affinity_group_prefix + self.middle_token + "1", policies='anti-affinity')
+
+        return group
+
+    def _wait_for_status(self, vm, accepted_statuses, attempts):
+        for i in range(attempts):
+            vm.get()
+            if vm.status in accepted_statuses:
+                break
+            sleep(1)
+
+    def _make_next_group_name(self, current_name):
+            split_name=current_name.split('.')
+            split_name[-1]=str(int(split_name[-1])+1)
+            return '.'.join(split_name)
+
+    def _list_anti_affinity_groups(self):
+        return [  group for group in self.nova_client.server_groups.list() if self.anti_affinity_group_prefix + self.middle_token in group.name ]
 
     def _check_keypair(self, name, public_key_path, private_key_path):
         """First checks if the keypair is valid, then checks if the keypair
